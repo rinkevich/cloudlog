@@ -6,9 +6,9 @@ import logging
 import marshal
 import re
 import struct
+import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Event, Process, Queue
 from queue import Empty
 
@@ -31,8 +31,10 @@ class CloudWatchLogEventStorage(deque):
         self._flush_threshold = flush_threshold
         self._last_flush_timestamp = time.time()
         self._sequence_token = None
-        self._publish_thread = ThreadPoolExecutor(max_workers=3)
-        self._publish_futures = []
+        self._publish_thread = None
+
+        self._persistent_storage = persistent
+        # TODO: save logs to local files
 
     @property
     def log_path(self):
@@ -90,7 +92,8 @@ class CloudWatchLogEventStorage(deque):
         while len(self):
             timestamp, message = self.popleft()
 
-            if records_size + len(message) + 26 > 1048576:
+            if records_size + len(message) + 26 > 1048576 or \
+                    len(records_batch) + 1 > 10000:
                 try:
                     self._publish_records(records_batch)
                 except botocore.exceptions.BotoCoreError:
@@ -114,35 +117,19 @@ class CloudWatchLogEventStorage(deque):
 
         self._last_flush_timestamp = time.time()
 
-    def flush(self):
+    def flush(self, require_publish=False):
         next_ship_timestamp = self._last_flush_timestamp + self._flush_interval
-        if next_ship_timestamp <= time.time() or \
+        if require_publish or next_ship_timestamp <= time.time() or \
                 len(self) >= self._flush_threshold:
 
-            if not self._publish_futures or all(
-                    future.done() for future in self._publish_futures):
-                future = self._publish_thread.submit(self._gather_log_records)
-                self._publish_futures.append(future)
+            if not self._publish_thread or not self._publish_thread.is_alive():
 
-        for idx, future in list(enumerate(
-                reversed(self._publish_futures), start=1)):
-            if future.done():
-                raised_exception = future.exception()
-                if raised_exception:
-                    try:
-                        raise raised_exception
-                    except Exception:
-                        logger.exception(
-                            f'publisher failed for {self.log_path}',
-                            exc_info=True)
-                del self._publish_futures[-idx]
+                if self._publish_thread is not None:
+                    self._publish_thread.join()
 
-
-    # TODO: persistant
-    # def append(self, *args, **kwargs):
-    #     super(CloudWatchLogEventStorage, self).append(*args, **kwargs)
-    #     print(*args, **kwargs)
-    #
+                self._publish_thread = threading.Thread(
+                    target=self._gather_log_records)
+                self._publish_thread.start()
 
 
 class WriterTaskType(enum.IntEnum):
@@ -179,6 +166,7 @@ class CloudWatchLogWriter(Process):
             self._log_streams[routing_key] = CloudWatchLogEventStorage(
                 flush_interval=task_data['interval'],
                 flush_threshold=task_data['threshold'],
+                persistent=task_data['persistent'],
                 client=client,
                 group_name=task_data['group_name'],
                 stream_name=task_data['stream_name'])
@@ -192,7 +180,7 @@ class CloudWatchLogWriter(Process):
         while True:
             try:
                 task_definition = self._queue.get(block=False)
-            except Empty:
+            except (Empty, EOFError):
                 break
             consumed_tasks += 1
             self._execute_task(*self.deserialize_task(task_definition))
@@ -226,10 +214,10 @@ class CloudWatchLogWriter(Process):
         self._consume_queue_tasks()
 
         for log_stream in self._log_streams.values():
-            log_stream.flush()
+            log_stream.flush(require_publish=True)
 
         for log_stream in self._log_streams.values():
-            log_stream.publisher.shutdown()
+            log_stream.publisher.join()
 
     @staticmethod
     def serialize_task(task, routing_key, payload=None):
@@ -273,7 +261,7 @@ class CloudWatchLogCollector(metaclass=Singleton):
         atexit.register(self.close)
 
     def register_log_stream(self, routing_key, group_name, stream_name,
-                            interval, threshold, region_name,
+                            interval, threshold, persistent, region_name,
                             aws_access_key_id, aws_secret_access_key):
 
         self._queue.put(self._writer.serialize_task(
@@ -282,6 +270,7 @@ class CloudWatchLogCollector(metaclass=Singleton):
                 'stream_name': stream_name,
                 'interval': interval,
                 'threshold': threshold,
+                'persistent': persistent,
                 'aws_access_key_id': aws_access_key_id,
                 'aws_secret_access_key': aws_secret_access_key,
                 'region_name': region_name,
@@ -310,7 +299,7 @@ class CloudWatchLogHandler(logging.Handler):
 
     def __init__(self, group_name, stream_name, interval=10, threshold=1000,
                  aws_access_key_id=None, aws_secret_access_key=None,
-                 region_name=None, *args, **kwargs):
+                 region_name=None, persistent=False, *args, **kwargs):
         super(CloudWatchLogHandler, self).__init__(*args, **kwargs)
 
         assert group_name and isinstance(group_name, six.string_types) and \
@@ -335,6 +324,7 @@ class CloudWatchLogHandler(logging.Handler):
             stream_name=stream_name,
             interval=interval,
             threshold=threshold,
+            persistent=persistent,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name)
