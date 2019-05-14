@@ -8,10 +8,12 @@ import re
 import struct
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import Event, Process, Queue
 from queue import Empty
 
 import boto3
+import botocore.exceptions
 import six
 
 logger = logging.getLogger(__name__)
@@ -20,17 +22,27 @@ logger = logging.getLogger(__name__)
 class CloudWatchLogEventStorage(deque):
 
     def __init__(self, client, group_name, stream_name, flush_interval=10,
-                 persistent_data=False, *args, **kwargs):
+                 flush_threshold=1000, persistent=False, *args, **kwargs):
         super(CloudWatchLogEventStorage, self).__init__(*args, **kwargs)
         self._client = client
         self._group_name = group_name
         self._stream_name = stream_name
         self._flush_interval = flush_interval
+        self._flush_threshold = flush_threshold
         self._last_flush_timestamp = time.time()
-        self._persistent_data = persistent_data
         self._sequence_token = None
+        self._publish_thread = ThreadPoolExecutor(max_workers=3)
+        self._publish_futures = []
 
-    def _get_log_stream_sequence_token(self):
+    @property
+    def log_path(self):
+        return f'{self._group_name}/{self._stream_name}'
+
+    @property
+    def publisher(self):
+        return self._publish_thread
+
+    def _get_sequence_token(self):
         try:
             self._client.create_log_group(logGroupName=self._group_name)
         except self._client.exceptions.ResourceAlreadyExistsException:
@@ -49,9 +61,9 @@ class CloudWatchLogEventStorage(deque):
                 .get('uploadSequenceToken')
         return sequence_token
 
-    def _ship_log_events(self, log_events):
+    def _publish_records(self, records_batch):
         if not self._sequence_token:
-            self._sequence_token = self._get_log_stream_sequence_token()
+                self._sequence_token = self._get_sequence_token()
 
         kwargs = {}
         if self._sequence_token:
@@ -60,43 +72,71 @@ class CloudWatchLogEventStorage(deque):
         response = self._client.put_log_events(
             logGroupName=self._group_name,
             logStreamName=self._stream_name,
-            logEvents=[{'timestamp': t, 'message': m} for t, m in log_events],
+            logEvents=[
+                {'timestamp': timestamp, 'message': message}
+                for timestamp, message in records_batch
+            ],
             **kwargs)
+
+        logger.debug(f'shipped {len(records_batch)} log records '
+                     f'to {self.log_path}')
 
         self._sequence_token = response['nextSequenceToken']
 
-    def flush(self, scheduled=True):
-        records = []
+    def _gather_log_records(self):
         records_size = 0
+        records_batch = []
 
-        next_ship_timestamp = self._last_flush_timestamp + self._flush_interval
-        ship_allowed = not scheduled or next_ship_timestamp <= time.time()
-
-        while ship_allowed:
-            # TODO: make bulletproof savings
-            if len(records) == 10000:
-                self._ship_log_events(records)
-                records = []
-                records_size = 0
-
-            # TODO: remove in more safe way
-            try:
-                timestamp, message = self.popleft()
-            except IndexError:
-                break
+        while len(self):
+            timestamp, message = self.popleft()
 
             if records_size + len(message) + 26 > 1048576:
-                self._ship_log_events(records)
-                records = []
+                try:
+                    self._publish_records(records_batch)
+                except botocore.exceptions.BotoCoreError:
+                    logger.exception(f'publishing failed for {self.log_path}')
+                    self.extend(records_batch)
+                    records_batch = []
+                    break
+
                 records_size = 0
+                records_batch = []
 
-            records.append((timestamp, message,))
+            records_size += len(message) + 26
+            records_batch.append((timestamp, message))
 
-        if len(records):
-            self._ship_log_events(records)
+        if records_batch:
+            try:
+                self._publish_records(records_batch)
+            except botocore.exceptions.BotoCoreError:
+                logger.exception(f'publishing failed for {self.log_path}')
+                self.extend(records_batch)
 
-        if ship_allowed:
-            self._last_flush_timestamp = time.time()
+        self._last_flush_timestamp = time.time()
+
+    def flush(self):
+        next_ship_timestamp = self._last_flush_timestamp + self._flush_interval
+        if next_ship_timestamp <= time.time() or \
+                len(self) >= self._flush_threshold:
+
+            if not self._publish_futures or all(
+                    future.done() for future in self._publish_futures):
+                future = self._publish_thread.submit(self._gather_log_records)
+                self._publish_futures.append(future)
+
+        for idx, future in list(enumerate(
+                reversed(self._publish_futures), start=1)):
+            if future.done():
+                raised_exception = future.exception()
+                if raised_exception:
+                    try:
+                        raise raised_exception
+                    except Exception:
+                        logger.exception(
+                            f'publisher failed for {self.log_path}',
+                            exc_info=True)
+                del self._publish_futures[-idx]
+
 
     # TODO: persistant
     # def append(self, *args, **kwargs):
@@ -115,7 +155,8 @@ class WriterTaskType(enum.IntEnum):
 class CloudWatchLogWriter(Process):
 
     def __init__(self, queue, close_lock, *args, **kwargs):
-        super(CloudWatchLogWriter, self).__init__(*args, **kwargs)
+        super(CloudWatchLogWriter, self).__init__(
+            name='cloudlog-writer', *args, **kwargs)
         self.daemon = True
         self._queue = queue
         self._close_lock = close_lock
@@ -137,6 +178,7 @@ class CloudWatchLogWriter(Process):
 
             self._log_streams[routing_key] = CloudWatchLogEventStorage(
                 flush_interval=task_data['interval'],
+                flush_threshold=task_data['threshold'],
                 client=client,
                 group_name=task_data['group_name'],
                 stream_name=task_data['stream_name'])
@@ -146,37 +188,59 @@ class CloudWatchLogWriter(Process):
             del self._log_streams[routing_key]
 
     def _consume_queue_tasks(self):
+        consumed_tasks = 0
         while True:
             try:
                 task_definition = self._queue.get(block=False)
             except Empty:
                 break
+            consumed_tasks += 1
             self._execute_task(*self.deserialize_task(task_definition))
+        logger.debug(f'consumed {consumed_tasks} tasks from the queue')
+        return consumed_tasks
 
     def run(self):
-        wait_time = 1.0  # 1000 micro seconds
-        # TODO: dynamic wait time in ms
+        # Consumption capacity is the message ingestion rate
+        consumption_capacity = 1000
+        wait_time = 1.0
+
         try:
             while not self._close_lock.wait(wait_time):
-                self._consume_queue_tasks()
+                consumed_count = self._consume_queue_tasks()
 
                 for log_stream in self._log_streams.values():
-                    log_stream.flush(scheduled=True)
+                    logger.debug(f'queue has {len(log_stream)} log records '
+                                 f'in {log_stream.log_path}')
+                    log_stream.flush()
+
+                # Dynamically adjustable timer dependant on task consumption
+                if consumed_count > consumption_capacity:
+                    consumption_capacity = consumed_count
+                wait_time = consumption_capacity**(
+                        -float(consumed_count) / consumption_capacity)
+                logger.debug('consumer will wait %.4f' % wait_time)
+
         except KeyboardInterrupt:
             pass
+
         self._consume_queue_tasks()
 
         for log_stream in self._log_streams.values():
-            log_stream.flush(scheduled=False)
+            log_stream.flush()
+
+        for log_stream in self._log_streams.values():
+            log_stream.publisher.shutdown()
 
     @staticmethod
     def serialize_task(task, routing_key, payload=None):
-        return struct.pack('!B16s', task, routing_key) + marshal.dumps(payload)
+        if isinstance(routing_key, six.string_types):
+            routing_key = routing_key.encode('utf-8')
+        return struct.pack('!B10s', task, routing_key) + marshal.dumps(payload)
 
     @staticmethod
     def deserialize_task(data):
-        task, routing_key = struct.unpack('!B16s', data[:17])
-        return task, routing_key, marshal.loads(data[17:])
+        task, routing_key = struct.unpack('!B10s', data[:11])
+        return task, routing_key, marshal.loads(data[11:])
 
 
 class Singleton(type):
@@ -209,14 +273,15 @@ class CloudWatchLogCollector(metaclass=Singleton):
         atexit.register(self.close)
 
     def register_log_stream(self, routing_key, group_name, stream_name,
-                            interval, region_name, aws_access_key_id,
-                            aws_secret_access_key):
+                            interval, threshold, region_name,
+                            aws_access_key_id, aws_secret_access_key):
 
         self._queue.put(self._writer.serialize_task(
             WriterTaskType.REGISTER, routing_key, {
                 'group_name': group_name,
                 'stream_name': stream_name,
                 'interval': interval,
+                'threshold': threshold,
                 'aws_access_key_id': aws_access_key_id,
                 'aws_secret_access_key': aws_secret_access_key,
                 'region_name': region_name,
@@ -225,7 +290,8 @@ class CloudWatchLogCollector(metaclass=Singleton):
 
         return lambda timestamp, message: self._queue.put(
             self._writer.serialize_task(
-                WriterTaskType.PUSH, routing_key, (timestamp, message)))
+                WriterTaskType.PUSH, routing_key.encode('utf-8'),
+                (timestamp, message)))
 
     def unregister_log_stream(self, routing_key):
         self._queue.put(self._writer.serialize_task(
@@ -242,7 +308,7 @@ class CloudWatchLogCollector(metaclass=Singleton):
 
 class CloudWatchLogHandler(logging.Handler):
 
-    def __init__(self, group_name, stream_name, interval=10,
+    def __init__(self, group_name, stream_name, interval=10, threshold=1000,
                  aws_access_key_id=None, aws_secret_access_key=None,
                  region_name=None, *args, **kwargs):
         super(CloudWatchLogHandler, self).__init__(*args, **kwargs)
@@ -260,14 +326,15 @@ class CloudWatchLogHandler(logging.Handler):
         assert isinstance(interval, six.integer_types) and interval > 0, \
             'Interval must be greater than zero.'
 
-        self._routing_key = hashlib.md5(
-            f'{group_name}/{stream_name}'.encode('ascii')).digest()
+        self._routing_key = hashlib.sha1(
+            f'{group_name}/{stream_name}'.encode('utf-8')).hexdigest()[:10]
         self._collector = CloudWatchLogCollector()
         self._emit = self._collector.register_log_stream(
             routing_key=self._routing_key,
             group_name=group_name,
             stream_name=stream_name,
             interval=interval,
+            threshold=threshold,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
             region_name=region_name)
