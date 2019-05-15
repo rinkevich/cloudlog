@@ -9,11 +9,9 @@ import struct
 import threading
 import time
 from collections import deque
-from multiprocessing import Event, Process, Queue
-from queue import Empty
+from queue import Empty, Queue
 
 import boto3
-import botocore.exceptions
 import six
 
 logger = logging.getLogger(__name__)
@@ -44,28 +42,38 @@ class CloudWatchLogEventStorage(deque):
     def publisher(self):
         return self._publish_thread
 
-    def _get_sequence_token(self):
-        try:
-            self._client.create_log_group(logGroupName=self._group_name)
-        except self._client.exceptions.ResourceAlreadyExistsException:
-            pass
+    def _get_sequence_token(self, create_bucket=False):
+        if create_bucket:
+            try:
+                self._client.create_log_group(logGroupName=self._group_name)
+            except self._client.exceptions.ResourceAlreadyExistsException:
+                pass
 
-        try:
-            self._client.create_log_stream(
-                logGroupName=self._group_name, logStreamName=self._stream_name)
-            sequence_token = None
-        except self._client.exceptions.ResourceAlreadyExistsException:
+            try:
+                self._client.create_log_stream(
+                    logGroupName=self._group_name,
+                    logStreamName=self._stream_name)
+                sequence_token = None
+            except self._client.exceptions.ResourceAlreadyExistsException:
+                response = self._client.describe_log_streams(
+                    logGroupName=self._group_name,
+                    logStreamNamePrefix=self._stream_name,
+                    orderBy='LogStreamName', descending=False, limit=1)
+                sequence_token = response['logStreams'][0] \
+                    .get('uploadSequenceToken')
+            return sequence_token
+        else:
             response = self._client.describe_log_streams(
                 logGroupName=self._group_name,
                 logStreamNamePrefix=self._stream_name,
                 orderBy='LogStreamName', descending=False, limit=1)
             sequence_token = response['logStreams'][0] \
                 .get('uploadSequenceToken')
-        return sequence_token
+            return sequence_token
 
     def _publish_records(self, records_batch):
         if not self._sequence_token:
-                self._sequence_token = self._get_sequence_token()
+            self._sequence_token = self._get_sequence_token(create_bucket=True)
 
         kwargs = {}
         if self._sequence_token:
@@ -96,7 +104,13 @@ class CloudWatchLogEventStorage(deque):
                     len(records_batch) + 1 > 10000:
                 try:
                     self._publish_records(records_batch)
-                except botocore.exceptions.BotoCoreError:
+                except self._client.exceptions.InvalidSequenceTokenException:
+                    logger.exception(f'publishing failed for {self.log_path}')
+                    self._sequence_token = self._get_sequence_token()
+                    self.extend(records_batch)
+                    records_batch = []
+                    break
+                except self._client.exceptions.BotoCoreError:
                     logger.exception(f'publishing failed for {self.log_path}')
                     self.extend(records_batch)
                     records_batch = []
@@ -111,7 +125,11 @@ class CloudWatchLogEventStorage(deque):
         if records_batch:
             try:
                 self._publish_records(records_batch)
-            except botocore.exceptions.BotoCoreError:
+            except self._client.exceptions.InvalidSequenceTokenException as e:
+                logger.exception(f'publishing failed for {self.log_path}')
+                self._sequence_token = self._get_sequence_token()
+                self.extend(records_batch)
+            except self._client.exceptions.BotoCoreError:
                 logger.exception(f'publishing failed for {self.log_path}')
                 self.extend(records_batch)
 
@@ -119,7 +137,8 @@ class CloudWatchLogEventStorage(deque):
 
     def flush(self, require_publish=False):
         next_ship_timestamp = self._last_flush_timestamp + self._flush_interval
-        if require_publish or next_ship_timestamp <= time.time() or \
+        if require_publish or \
+                next_ship_timestamp <= time.time() or \
                 len(self) >= self._flush_threshold:
 
             if not self._publish_thread or not self._publish_thread.is_alive():
@@ -139,11 +158,10 @@ class WriterTaskType(enum.IntEnum):
     UNREGISTER = 3
 
 
-class CloudWatchLogWriter(Process):
+class CloudWatchLogWriter(threading.Thread):
 
     def __init__(self, queue, close_lock, *args, **kwargs):
-        super(CloudWatchLogWriter, self).__init__(
-            name='cloudlog-writer', *args, **kwargs)
+        super(CloudWatchLogWriter, self).__init__(*args, **kwargs)
         self.daemon = True
         self._queue = queue
         self._close_lock = close_lock
@@ -180,7 +198,7 @@ class CloudWatchLogWriter(Process):
         while True:
             try:
                 task_definition = self._queue.get(block=False)
-            except (Empty, EOFError):
+            except (Empty, EOFError, KeyboardInterrupt, SystemExit):
                 break
             consumed_tasks += 1
             self._execute_task(*self.deserialize_task(task_definition))
@@ -197,8 +215,8 @@ class CloudWatchLogWriter(Process):
                 consumed_count = self._consume_queue_tasks()
 
                 for log_stream in self._log_streams.values():
-                    logger.debug(f'queue has {len(log_stream)} log records '
-                                 f'in {log_stream.log_path}')
+                    logger.debug('queue has %s log records in %s' % (
+                        len(log_stream), log_stream.log_path))
                     log_stream.flush()
 
                 # Dynamically adjustable timer dependant on task consumption
@@ -207,17 +225,19 @@ class CloudWatchLogWriter(Process):
                 wait_time = consumption_capacity**(
                         -float(consumed_count) / consumption_capacity)
                 logger.debug('consumer will wait %.4f' % wait_time)
+                logger.debug(threading.get_ident())
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             pass
 
-        self._consume_queue_tasks()
+        finally:
+            self._consume_queue_tasks()
 
-        for log_stream in self._log_streams.values():
-            log_stream.flush(require_publish=True)
+            for log_stream in self._log_streams.values():
+                log_stream.flush(require_publish=True)
 
-        for log_stream in self._log_streams.values():
-            log_stream.publisher.join()
+            for log_stream in self._log_streams.values():
+                log_stream.publisher.join()
 
     @staticmethod
     def serialize_task(task, routing_key, payload=None):
@@ -247,13 +267,12 @@ class Singleton(type):
         return cls._instance
 
 
-class CloudWatchLogCollector(metaclass=Singleton):
-    # Log collector is implemented as a singleton, in result reduces branching
-    # when multiple log handlers are used. This prevents from creating
-    # a process for every log handler.
+class CloudWatchLogCollector:
+    # Log collector must be a singleton to reduce necessary thread count
+    # to one for any count of log handlers.
 
     def __init__(self):
-        self._close_lock = Event()
+        self._close_lock = threading.Event()
         self._queue = Queue()
         self._writer = CloudWatchLogWriter(self._queue, self._close_lock)
         self._writer.start()
