@@ -1,9 +1,9 @@
 -i https://pypi.org/simple
-boto3==1.9.139
-botocore==1.12.139
-docutils==0.14
-jmespath==0.9.4
-python-dateutil==2.8.0 ; python_version >= '2.7'
-s3transfer==0.2.0
-six==1.12.0
-urllib3==1.24.2 ; python_version >= '3.4'
+boto3==1.14.43
+botocore==1.17.43
+docutils==0.15.2
+jmespath==0.10.0
+python-dateutil==2.8.1
+s3transfer==0.3.3
+six==1.15.0
+urllib3==1.25.10 ; python_version != '3.4'

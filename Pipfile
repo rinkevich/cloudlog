@@ -5,6 +5,8 @@ verify_ssl = true
 
 [dev-packages]
 isort = "*"
+ipython = "*"
+boto3-stubs = "*"
 
 [packages]
 boto3 = "*"
