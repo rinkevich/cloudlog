@@ -1,16 +1,19 @@
 import atexit
+import json
 import logging
 import threading
 import time
 import uuid
 from abc import abstractmethod
+from logging import LogRecord
 from logging.handlers import QueueHandler, QueueListener
 from queue import Queue
 from socket import gethostname
+from typing import Any, List, Optional, Tuple, Type
 
 import boto3
 
-__all__ = ('CentralizedLogHandler', 'CloudWatchLogHandler')
+__all__ = ('CentralizedLogHandler', 'CloudWatchLogHandler', 'JSONFormatter')
 
 
 class CentralizedLogHandler(QueueHandler):
@@ -21,7 +24,8 @@ class CentralizedLogHandler(QueueHandler):
     """
     __slots__ = "queue", "_listener"
 
-    def __init__(self, handlers, queue=None, respect_handler_level=False):
+    def __init__(self, handlers: List[logging.Handler], queue: Any = None,
+                 respect_handler_level: bool = True):
         """
         Initialize queued log handler.
 
@@ -48,7 +52,7 @@ class TimedBufferingHandler(logging.Handler):
     __slots__ = "capacity", "interval", "buffer", "timestamp", \
                 "_exit_lock", "_thread"
 
-    def __init__(self, capacity, interval, *args, **kwargs):
+    def __init__(self, capacity: int, interval: int, *args, **kwargs):
         """
         Initialize the handler with the buffer size and sender interval.
 
@@ -95,7 +99,7 @@ class TimedBufferingHandler(logging.Handler):
         return (len(self.buffer) >= self.capacity) or \
                (time.time() - self.interval > self.timestamp)
 
-    def emit(self, record):
+    def emit(self, record: LogRecord):
         """
         Emit a record.
 
@@ -125,7 +129,7 @@ class TimedBufferingHandler(logging.Handler):
             logging.Handler.close(self)
 
     @abstractmethod
-    def drain(self, buffer):
+    def drain(self, buffer: List[LogRecord]) -> int:
         """
         Try to drain buffer as much as possible and return how many
         records had been saved.
@@ -149,9 +153,14 @@ class CloudWatchLogHandler(TimedBufferingHandler):
         "aws_secret_access_key", "aws_session_token", "region_name",
         "client", "sequence_token",)
 
-    def __init__(self, group_name, stream_name=None, aws_access_key_id=None,
-                 aws_secret_access_key=None, aws_session_token=None,
-                 region_name=None, *args, **kwargs):
+    def __init__(self,
+                 group_name: str,
+                 stream_name: str = None,
+                 aws_access_key_id: str = None,
+                 aws_secret_access_key: str = None,
+                 aws_session_token: str = None,
+                 region_name: str = None,
+                 *args, **kwargs):
         """
         Initialize CloudWatch logging handler
 
@@ -171,7 +180,7 @@ class CloudWatchLogHandler(TimedBufferingHandler):
             region_name=region_name, )
         self.sequence_token = self._get_sequence_token()
 
-    def _get_sequence_token(self):
+    def _get_sequence_token(self) -> Optional[str]:
         try:
             response = self.client.describe_log_streams(
                 logGroupName=self.group_name,
@@ -186,7 +195,7 @@ class CloudWatchLogHandler(TimedBufferingHandler):
                 logStreamName=self.stream_name)
             return None
 
-    def _put_log_events(self, records_batch):
+    def _put_log_events(self, records_batch: List[Tuple[int, str]]):
         response = self.client.put_log_events(
             logGroupName=self.group_name,
             logStreamName=self.stream_name,
@@ -197,7 +206,7 @@ class CloudWatchLogHandler(TimedBufferingHandler):
             sequenceToken=self.sequence_token)
         self.sequence_token = response["nextSequenceToken"]
 
-    def drain(self, buffer):
+    def drain(self, buffer: List[LogRecord]) -> int:
         """
         Drain buffer to CloudWatch stream.
 
@@ -234,3 +243,87 @@ class CloudWatchLogHandler(TimedBufferingHandler):
             self.sequence_token = self._get_sequence_token()
             return sent_records
         return sent_records + len(message_batch)
+
+
+BUILTIN_ATTRS = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "module",
+    "msecs",
+    "message",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+}
+
+
+class JSONFormatter(logging.Formatter):
+    """JSON logging formatter"""
+
+    def __init__(self, encoder: Optional[Type[json.JSONEncoder]] = None,
+                 *args, **kwargs):
+        """
+        Initialize JSON logging formatter
+
+        :param json.JSONEncoder encoder: JSON encoder
+        """
+        super().__init__(*args, **kwargs)
+        self.encoder = encoder
+
+    def format(self, record: LogRecord) -> str:
+        """
+        Format log record to a JSON object
+
+        :param logging.LogRecord record: LogRecord object
+        :return: JSON serialized log message
+        :rtype: str
+        """
+        return json.dumps(self.prepare(record), cls=self.encoder)
+
+    def prepare(self, record: LogRecord) -> dict:
+        """
+        Construct record object from log record instance
+
+        :param logging.LogRecord record: LogRecord object
+        :return: log message dict
+        :rtype: dict
+        """
+        extra_attrs = {
+            attr_name: getattr(record, attr_name)
+            for attr_name in filter(
+                lambda attr_name: attr_name not in BUILTIN_ATTRS,
+                vars(record)
+            )
+        }
+
+        record_body = {
+            "hostname": gethostname(),
+            "logger": record.name,
+            "timestamp": int(record.created),
+            "level": record.levelname,
+            **extra_attrs,
+        }
+
+        if isinstance(record.msg, dict):
+            record_body["message"] = record.msg
+        else:
+            record_body["message"] = record.getMessage()
+
+        if record.exc_info:
+            record_body["exc_info"] = self.formatException(record.exc_info)
+
+        return record_body
